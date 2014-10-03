@@ -56,18 +56,23 @@ class Trainer(object):
     def __init__(self, network, **kwargs):
         super(Trainer, self).__init__()
 
-        self.params = network.params(**kwargs)
+        self.params = network.params()
 
-        self.J = network.J(**kwargs)
-        self.cost_exprs = [self.J]
+        self.cost = network.cost_class.cost(network.output)
+
+        self.cost_exprs = [self.cost]
         self.cost_names = ['J']
         for name, monitor in network.monitors:
             self.cost_names.append(name)
             self.cost_exprs.append(monitor)
 
+        self.batchsize = 20
         logging.info('compiling evaluation function')
-        self.f_eval = theano.function(
-            network.inputs, self.cost_exprs, updates=network.updates)
+        self.evaluation_model = theano.function(network.inputs + network.cost_class.inputs,
+                                      self.cost_exprs,
+                                      givens={l.batchsize: self.batchsize
+                                              for l in network.layers},
+                                      on_unused_input='ignore')
 
         self.validation_frequency = kwargs.get('validate', 10)
         self.min_improvement = kwargs.get('min_improvement', 0.)
@@ -113,7 +118,8 @@ class Trainer(object):
         '''
         costs = list(zip(
             self.cost_names,
-            np.mean([self.f_eval(*x) for x in valid_set], axis=0)))
+            np.mean([self.evaluation_model(data, target)
+                     for data, target in valid_set.minibatches()], axis=0)))
         marker = ''
         # this is the same as: (J_i - J_f) / J_i > min improvement
         _, J = costs[0]
@@ -122,11 +128,11 @@ class Trainer(object):
             self.best_iter = iteration
             self.best_params = [p.get_value().copy() for p in self.params]
             marker = ' *'
-        info = ' '.join('%s=%.2f' % el for el in costs)
+        info = ' '.join('%s=%.3f' % el for el in costs)
         logging.info('validation %i %s%s', iteration + 1, info, marker)
         return iteration - self.best_iter < self.patience
 
-    def train(self, train_set, valid_set=None, **kwargs):
+    def train(self, dataset, valid):
         raise NotImplementedError
 
 
@@ -140,24 +146,26 @@ class SGD(Trainer):
         self.learning_rate = kwargs.get('learning_rate', 0.01)
 
         logging.info('compiling %s learning function', self.__class__.__name__)
-        self.f_learn = theano.function(
-            network.inputs,
+        self.learning_model = theano.function(
+            network.inputs + network.cost_class.inputs,
             self.cost_exprs,
-            updates=list(network.updates) + list(self.learning_updates()))
+            givens={l.batchsize: self.batchsize for l in network.layers},
+            on_unused_input='ignore',
+            updates=list(self.learning_updates()))
 
     def learning_updates(self):
         for param in self.params:
-            delta = self.learning_rate * TT.grad(self.J, param)
+            delta = self.learning_rate * TT.grad(self.cost, param)
             velocity = theano.shared(
                 np.zeros_like(param.get_value()), name=param.name + '_vel')
             yield velocity, self.momentum * velocity - delta
             yield param, param + velocity
 
-    def train(self, train_set, valid_set=None, **kwargs):
+    def train(self, train_set, valid_set, **kwargs):
         '''We train over mini-batches and evaluate periodically.'''
         iteration = 0
         while True:
-            if not iteration % self.validation_frequency:
+            if iteration % self.validation_frequency == 0 and iteration !=0:
                 try:
                     if not self.evaluate(iteration, valid_set):
                         logging.info('patience elapsed, bailing out')
@@ -169,7 +177,9 @@ class SGD(Trainer):
             try:
                 costs = list(zip(
                     self.cost_names,
-                    np.mean([self.train_minibatch(*x) for x in train_set], axis=0)))
+                    np.mean([self.train_minibatch(data, target)
+                             for data,  target in train_set.minibatches()],
+                             axis=0)))
             except KeyboardInterrupt:
                 logging.info('interrupted!')
                 break
@@ -182,8 +192,8 @@ class SGD(Trainer):
 
         self.set_params(self.best_params)
 
-    def train_minibatch(self, *x):
-        return self.f_learn(*x)
+    def train_minibatch(self, data, target):
+        return self.learning_model(data, target)
 
 
 class NAG(SGD):
@@ -254,7 +264,7 @@ class NAG(SGD):
     def learning_updates(self):
         # step 2. record the gradient here.
         for param, step, velocity in zip(self.params, self._steps, self._velocities):
-            yield velocity, step - self.learning_rate * TT.grad(self.J, param)
+            yield velocity, step - self.learning_rate * TT.grad(self.cost, param)
 
         # step 3. update each of the parameters, removing the step that we took
         # to compute the gradient.
@@ -295,12 +305,12 @@ class Rprop(SGD):
         self.step_increase = kwargs.get('rprop_increase', 1.2)
         self.step_decrease = kwargs.get('rprop_decrease', 0.5)
 
-        self.min_step = kwargs.get('rprop_min_step', 0.)
-        self.max_step = kwargs.get('rprop_max_step', 100.)
+        self.min_step = kwargs.get('rprop_min_step', 0.00001)
+        self.max_step = kwargs.get('rprop_max_step', 12)
         step = kwargs.get('rprop_initial_step', 0.001)
 
         # set up space for temporary variables used during learning.
-        self.params = network.params(**kwargs)
+        self.params = network.params()
         self.grads = []
         self.steps = []
         for param in self.params:
@@ -313,13 +323,17 @@ class Rprop(SGD):
 
     def learning_updates(self):
         for param, step_tm1, grad_tm1 in zip(self.params, self.steps, self.grads):
-            grad = TT.grad(self.J, param)
+            grad = TT.grad(self.cost, param)
             same = grad * grad_tm1 > 0
             diff = grad * grad_tm1 < 0
-            step = TT.minimum(self.max_step, TT.maximum(self.min_step, step_tm1 * (
-                (1 - same) * (1 - diff) +
-                same * self.step_increase +
-                diff * self.step_decrease)))
+            step = TT.minimum(
+                self.max_step,
+                TT.maximum(
+                    self.min_step,
+                    step_tm1 * (same * self.step_increase +
+                                diff * self.step_decrease)
+                )
+            )
             grad = grad - diff * grad
             yield param, param - TT.sgn(grad) * step
             yield grad_tm1, grad
@@ -337,11 +351,12 @@ class Scipy(Trainer):
         self.method = method
 
         logging.info('compiling gradient function')
-        self.f_grad = theano.function(network.inputs, TT.grad(self.J, self.params))
+        self.f_grad = theano.function(network.inputs,
+                                      TT.grad(self.cost, self.params))
 
     def function_at(self, x, train_set):
         self.set_params(self.flat_to_arrays(x))
-        return np.mean([self.f_eval(*x)[0] for x in train_set])
+        return np.mean([self.learning_model(*x)[0] for x in train_set])
 
     def gradient_at(self, x, train_set):
         self.set_params(self.flat_to_arrays(x))
@@ -354,7 +369,7 @@ class Scipy(Trainer):
     def train(self, train_set, valid_set=None, **kwargs):
         def display(x):
             self.set_params(self.flat_to_arrays(x))
-            costs = np.mean([self.f_eval(*x) for x in train_set], axis=0)
+            costs = np.mean([self.learning_model(*x) for x in train_set], axis=0)
             cost_desc = ' '.join(
                 '%s=%.2f' % el for el in zip(self.cost_names, costs))
             logging.info('scipy %s %i/%i %s',
@@ -409,6 +424,7 @@ class HF(Trainer):
     class will attempt to download it from github.
     '''
 
+    # TODO: replace the download
     URL = 'https://raw.github.com/boulanni/theano-hf/master/hf.py'
 
     def __init__(self, network, **kwargs):
@@ -437,7 +453,7 @@ class HF(Trainer):
             self.params,
             network.inputs,
             network.y,
-            [network.J(**kwargs)] + [mon for _, mon in network.monitors],
+            [network.cost_class(**kwargs)] + [mon for _, mon in network.monitors],
             network.hiddens[-1] if isinstance(network, recurrent.Network) else None)
 
         # fix mapping from kwargs into a dict to send to the hf optimizer
@@ -581,29 +597,3 @@ class Layerwise(Trainer):
         net.weights = weights
         net.biases = biases
 
-
-class FORCE(Trainer):
-    '''FORCE is a training method for recurrent nets by Sussillo & Abbott.
-
-    This implementation needs some more love before it will work.
-    '''
-
-    def __init__(self, network, **kwargs):
-        super(FORCE, Trainer).__init__(network, **kwargs)
-
-    def train(self, train_set, valid_set=None, **kwargs):
-        W_in, W_pool, W_out = network.weights
-
-        n = W_pool.get_value(borrow=True).shape[0]
-        P = theano.shared(np.eye(n).astype(FLOAT) * self.learning_rate)
-
-        k = TT.dot(P, network.state)
-        rPr = TT.dot(network.state, k)
-        c = 1. / (1. + rPr)
-        dw = network.error(**kwargs) * c * k
-
-        updates = {}
-        updates[P] = P - c * TT.outer(k, k)
-        updates[W_pool] = W_pool - dw
-        updates[W_out] = W_out - dw
-        updates[b_out] = b_out - self.learning_rate * TT.grad(J, b_out)

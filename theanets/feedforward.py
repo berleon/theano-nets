@@ -520,7 +520,7 @@ class Network(object):
             DeprecationWarning)
         return self.load_params(filename)
 
-    def J(self, weight_l1=0, weight_l2=0, hidden_l1=0, hidden_l2=0, contractive_l2=0, **unused):
+    def cost(self, weight_l1=0, weight_l2=0, hidden_l1=0, hidden_l2=0, contractive_l2=0, **unused):
         '''Return a variable representing the cost or loss for this network.
 
         Parameters

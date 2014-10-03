@@ -24,7 +24,7 @@ import climate
 import theano.tensor as TT
 import warnings
 
-from .dataset import SequenceDataset as Dataset
+from .dataset import Dataset
 from . import feedforward
 from . import trainer
 

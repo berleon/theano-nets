@@ -13,8 +13,8 @@ climate.enable_default_logging()
 
 
 class RICA(theanets.Autoencoder):
-    def J(self, weight_inverse=0, **kwargs):
-        cost = super(RICA, self).J(**kwargs)
+    def cost(self, weight_inverse=0, **kwargs):
+        cost = super(RICA, self).cost(**kwargs)
         if weight_inverse > 0:
             cost += sum((weight_inverse / (w * w).sum(axis=0)).sum() for w in self.weights)
         return cost

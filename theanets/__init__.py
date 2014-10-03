@@ -20,7 +20,6 @@
 
 '''This package groups together a bunch of theano code for neural nets.'''
 
-from .dataset import SequenceDataset as Dataset
 from .feedforward import Network, Autoencoder, Regressor, Classifier
 from .main import Experiment
 from . import flags

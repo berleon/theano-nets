@@ -1,4 +1,4 @@
-# Copyright (c) 2012 Leif Johnson <leif@leifjohnson.net>
+# Copyright (c) 2014 Leon Sixt
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -21,100 +21,51 @@
 '''This file contains a class for handling batched datasets.'''
 
 import climate
-import collections
 import numpy.random as rng
-
+import numpy as np
+from sklearn.datasets import fetch_mldata
 logging = climate.get_logger(__name__)
 
 
-class SequenceDataset(object):
-    '''This class handles batching and shuffling a dataset.
+class Dataset(object):
+    def __init__(self, data, target=None):
+        self.size = target.shape[0]
+        self.data = data
+        self.target = target
 
-    It's mostly copied from the dataset class from hf.py, except that the
-    constructor has slightly different semantics.
-    '''
+    def split(self, *ratios):
+        assert sum(ratios) == 1, "ratios must sum to 1"
+        ratio2N = lambda r: r*self.size
+        last = 0
+        for r in ratios:
+            yield Dataset(data=self.data[ratio2N(last):ratio2N(r+last)],
+                          target=self.target[ratio2N(last):ratio2N(r+last)])
+            last += r
 
-    def __init__(self, *data, **kwargs):
-        '''Create a minibatch dataset from a number of different data arrays.
-
-        Positional arguments:
-
-        There should be one unnamed keyword argument for each input in the
-        neural network that will be processing this dataset. For instance, if
-        you are dealing with a classifier network, you'll need one argument for
-        the inputs (e.g., mnist digit pixels), and another argument for the
-        target outputs (e.g., digit class labels). The order of the arguments
-        should be the same as the order of inputs in the network. All arguments
-        are expected to have the same number of elements along the first axis.
-
-        Alternatively, if there is only one positional arg, and it is callable,
-        then that callable will be invoked repeatedly at training and test time.
-        Each invocation of the callable should return a tuple containing one
-        minibatch of data. The callable will not be passed any arguments.
-
-        Keyword arguments:
-
-        size or batch_size: The size of the mini-batches to create from the
-          data sequences. Defaults to 32.
-        batches: The number of batches to yield for each call to iterate().
-          Defaults to the length of the data divided by batch_size.
-        label: A string that is used to describe this dataset. Usually something
-          like 'test' or 'train'.
-        '''
-        self.label = kwargs.get('label', 'dataset')
-        self.number_batches = kwargs.get('batches')
-        self.batch = 0
-
-        size = kwargs.get('size', kwargs.get('batch_size', 32))
-        batch = None
-        cardinality = None
-        self.callable = None
-        self.batches = None
-        if len(data) == 1 and isinstance(data[0], collections.Callable):
-            self.callable = data[0]
-            cardinality = '->'
-            batch = self.callable()
-            if not self.number_batches:
-                self.number_batches = size
-        else:
-            self.batches = [
-                [d[i:i + size] for d in data]
-                for i in range(0, len(data[0]), size)]
-            self.shuffle()
-            cardinality = len(self.batches)
-            batch = self.batches[0]
-            if not self.number_batches:
-                self.number_batches = cardinality
-
-        logging.info('data %s: %s mini-batches of %s',
-            self.label, cardinality, ', '.join(str(x.shape) for x in batch))
-
-    def __iter__(self):
-        return self.iterate(True)
+    def reshape(self, shape):
+        self.data = self.data.reshape((self.size,) + shape)
 
     def shuffle(self):
-        rng.shuffle(self.batches)
+        rng_state = rng.get_state()
+        rng.shuffle(self.data)
+        rng.set_state(rng_state)
+        rng.shuffle(self.target)
 
-    def iterate(self, update=True):
-        if self.callable:
-            return self._iter_callable()
-        return self._iter_batches(update)
+    def minibatches(self, size=20):
+        assert size < self.size
+        for s, e in zip(range(0, self.size-size, size),
+                        range(size, self.size, size)):
+            yield self.data[s:e], self.target[s:e]
 
-    def _iter_batches(self, update=True):
-        k = len(self.batches)
-        for b in range(self.number_batches):
-            yield self.batches[(self.batch + b) % k]
-        if update:
-            self.update()
+    @staticmethod
+    def fetch_mldata(dataname, target_name='label', data_name='data',
+                 transpose_data=True, data_home=None):
+        raw_dataset = fetch_mldata(dataname, target_name=target_name,
+                               data_name=data_name,
+                               transpose_data=transpose_data,
+                               data_home=data_home)
 
-    def _iter_callable(self):
-        for b in range(self.number_batches):
-            yield self.callable()
+        dataset = Dataset(data=raw_dataset.data,
+                          target=np.asarray(raw_dataset.target, np.int32))
+        return dataset
 
-    def update(self):
-        if self.callable:
-            return
-        self.batch += self.number_batches
-        if self.batch >= len(self.batches):
-            self.shuffle()
-            self.batch = 0
